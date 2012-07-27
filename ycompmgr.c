@@ -312,10 +312,15 @@ static inline win_t * win_find(Window const wid)
             (void *)&wid));
 }
 
-static inline bool is_visible (win_t const * const w)
+static inline bool win_is_inside_root (win_t const * const w)
 {
-    return (w->state == IsViewable &&
-            (w->x + w->w) >= 0 && (w->y + w->h) >= 0 && w->x < root->w && w->y < root->h);
+    return ((w->x + w->w) > 0 && (w->y + w->h) > 0
+            && w->x < root->w && w->y < root->h);
+}
+
+static inline bool win_is_visible (win_t const * const w)
+{
+    return (w->state == IsViewable && win_is_inside_root(w));
 }
 
 static inline bool win_size_changed (
@@ -760,7 +765,7 @@ bool list_cb_paint_item (list_elem_t * const e, list_cb_arg_t *unsed_arg)
 {
     win_t * const w = (win_t * const)e;
 
-    if (w && is_visible(w)) {
+    if (w && win_is_visible(w)) {
         if (w->content) {
             XserverRegion const w_reg = paint_do_dirty_work(cs,
                     CAIRO_OPERATOR_SOURCE, &(w->content_sag));
@@ -919,7 +924,7 @@ int main (int argc, char *argv[])
                     XDamageNotifyEvent const * const dmg_ev = (XDamageNotifyEvent *)&event;
                     win_t const * const w = win_find(dmg_ev->drawable);
 
-                    if (w && w->damage) {
+                    if (w && win_is_visible(w) && w->damage) {
                         XserverRegion parts = XFixesCreateRegion(display, NULL, 0);
                         XDamageSubtract(display, w->damage, None, parts);
                         XFixesTranslateRegion(display, parts, w->x + w->b, w->y + w->b);
