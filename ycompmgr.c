@@ -59,6 +59,11 @@
 #define ATOM_WIN_BGRND_XROOTPMAP    "_XROOTPMAP_ID"
 #define ATOM_WIN_BGRND_XSETROOT     "_XSETROOT_ID"
 
+/* Flags for ymalloc - a simple wrapper over standard function to conveniently
+ * handle typical use scenario. */
+#define YM_SAMURAI                  0x1     /* < Die in case of failure. */
+#define YM_ZEROIZE                  0x2     /* < Clear memory that has been allocated. */
+
 #ifndef M_PI
 # define M_PI                       3.14159265358979323846
 #endif
@@ -165,6 +170,18 @@ bool list_cb_print_item (list_elem_t *, list_cb_arg_t *);
 static void win_map (Window const);
 static void win_unmap (Window const);
 
+inline void *ymalloc (size_t const size, unsigned char const flags)
+{
+    void * const ret_ptr = malloc(size);
+
+    if (!ret_ptr && flags & YM_SAMURAI)
+        errx(EXIT_FAILURE, "Cannot allocate memory\n");
+
+    if (ret_ptr && flags & YM_ZEROIZE)
+        memset(ret_ptr, 0, size);
+
+    return ret_ptr;
+}
 
 static bool list_init (list_t * const l)
 {
@@ -490,10 +507,7 @@ static win_t * win_add (Window const wid, bool const existing)
     XWindowAttributes attr;
 
     if (XERR_IGNORE_FAULT(XGetWindowAttributes(display, wid, &attr))) {
-        win_t * const w = malloc(sizeof(win_t));
-        if (!w)
-            errx(EXIT_FAILURE, "Cannot allocate memory\n");
-        memset(w, 0, sizeof(win_t));
+        win_t * const w = ymalloc(sizeof(win_t), YM_SAMURAI | YM_ZEROIZE);
 
         w->wid    = wid;
         w->screen = attr.screen;
