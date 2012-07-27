@@ -54,12 +54,20 @@
 #define ATOM_WIN_TYPE_DESKTOP       "_NET_WM_WINDOW_TYPE_DESKTOP"
 #define ATOM_WIN_TYPE_DOCK          "_NET_WM_WINDOW_TYPE_DOCK"
 #define ATOM_WIN_TYPE_NORMAL        "_NET_WM_WINDOW_TYPE_NORMAL"
-
 #define ATOM_WIN_OPACITY            "_NET_WM_WINDOW_OPACITY"
+
+#define ATOM_WIN_BGRND_XROOTPMAP    "_XROOTPMAP_ID"
+#define ATOM_WIN_BGRND_XSETROOT     "_XSETROOT_ID"
 
 #ifndef M_PI
 # define M_PI                       3.14159265358979323846
 #endif
+
+#define XERR_IGNORE_FAULT(expression)                       \
+({                                                          \
+    xerr_ignore(XNextRequest(display));                     \
+    (expression);                                           \
+})
 
 typedef union {
     Window              wid;
@@ -82,13 +90,22 @@ typedef struct {
 
 typedef bool (*list_cb_t)(list_elem_t *, list_cb_arg_t *);
 
+typedef union {
+    XRectangle          r;
+    struct {
+        short           x, y;
+        unsigned short  w, h;
+    };
+} ease_xrect_t;
+
 typedef struct {
     cairo_surface_t     *surf;
-    XRectangle          geom;
+    ease_xrect_t        geom;
 } surf_geom_t;
 
 typedef struct {
     struct _list_elem;
+    ease_xrect_t;
 
     Window              wid;
     Window              above;
@@ -100,53 +117,53 @@ typedef struct {
     int                 b;
 
     union {
-        surf_geom_t content_sag;
+        surf_geom_t     content_sag;
         cairo_surface_t *content;
     };
  
     union {
-        surf_geom_t shadow_sag;
+        surf_geom_t     shadow_sag;
         cairo_surface_t *shadow;
     };
-
-    union {
-        XRectangle r;
-        struct {
-            short x, y;
-            unsigned short w, h;
-        };
-    };
-
 } win_t;
+
+typedef int (*xerr_handler_t)(Display *, XErrorEvent *);
+
+static struct {
+    xerr_handler_t      real_handler;
+    unsigned long       seq;
+    bool                valid;
+} xerr_data = { NULL, 0, false };
 
 static union {
     struct {
-        Atom        win_type;
-        Atom        win_type_dtop;
-        Atom        win_type_dock;
-        Atom        win_type_norm;
-        Atom        win_opacity;
+        Atom            win_type;
+        Atom            win_type_dtop;
+        Atom            win_type_dock;
+        Atom            win_type_norm;
+        Atom            win_opacity;
     };
-    Atom            as_array[4];
+    Atom                as_array[5];
 } atoms = { None };
 
 static struct {
-    short           shdw_x_offset;
-    short           shdw_y_offset;
-    unsigned short  shdw_radius;
-    float           shdw_opacity;
+    short               shdw_x_offset;
+    short               shdw_y_offset;
+    unsigned short      shdw_radius;
+    float               shdw_opacity;
 } opts = { 10, 10, 20, 0.5 };
 
-static Display *display;
-static win_t *root;
-static list_t win_list;
-static cairo_surface_t *cs        = NULL;
-static cairo_surface_t *cs_alp    = NULL;
-static XserverRegion dmg_glbl_reg = None;
+static Display          *display;
+static win_t            *root;
+static list_t           win_list;
+static cairo_surface_t  *cs          = NULL;
+static cairo_surface_t  *cs_alp      = NULL;
+static XserverRegion    dmg_glbl_reg = None;
 
 bool list_cb_cmp_win (list_elem_t *, list_cb_arg_t *);
-bool list_cb_print_item (list_elem_t *e, list_cb_arg_t *unsed_arg);
-static void win_map (Window const wid);
+bool list_cb_print_item (list_elem_t *, list_cb_arg_t *);
+static void win_map (Window const);
+static void win_unmap (Window const);
 
 
 static bool list_init (list_t * const l)
@@ -248,40 +265,31 @@ static void dmg_glbl_add (XserverRegion r)
         dmg_glbl_reg = r;
 }
 
-typedef struct {
-    unsigned long seq;
-    bool valid;
-} xerr_seq_t;
-
-static xerr_seq_t _xerr_ignored = { 0, false };
-
-static void xerr_ignore (const unsigned long seq)
+static int xerr_wrapped_handler (Display *err_dpy, XErrorEvent *err_ev)
 {
-    _xerr_ignored.valid = true;
-    _xerr_ignored.seq = seq;
-}
-
-static int xerr_handler (Display *unsed, XErrorEvent *event)
-{
-    if (_xerr_ignored.valid && _xerr_ignored.seq == event->serial) {
-        _xerr_ignored.valid = false;
+    if (xerr_data.valid && xerr_data.seq == err_ev->serial) {
+        xerr_data.valid = false;
         return 0;
     }
 
-    warnx("ERROR\n");
+    return xerr_data.real_handler(err_dpy, err_ev);
+}
 
-    return 1;
+static void xerr_ignore (unsigned long const seq)
+{
+    xerr_data.valid = true;
+    xerr_data.seq   = seq;
+
+    if (!xerr_data.real_handler)
+        xerr_data.real_handler = XSetErrorHandler(xerr_wrapped_handler);
 }
 
 static inline bool win_want_shadow (win_t const * const w)
 {
-    if (w->wid == root->wid || w->type == atoms.win_type_dock)
-        return false;
-
-    return true;
+    return (w->wid != root->wid && w->type != atoms.win_type_dock);
 }
 
-static inline win_t * win_find(const Window wid)
+static inline win_t * win_find(Window const wid)
 {
     return ((win_t *)list_find(&win_list, list_cb_cmp_win,
             (void *)&wid));
@@ -293,19 +301,27 @@ static inline bool is_visible (win_t const * const w)
             (w->x + w->w) >= 0 && (w->y + w->h) >= 0 && w->x < root->w && w->y < root->h);
 }
 
-static inline bool win_size_changed (win_t const * const w, XConfigureEvent const * const ev)
+static inline bool win_size_changed (
+        win_t           const * const w,
+        XConfigureEvent const * const ev)
 {
-    return (w->w != ev->width || w->h != ev->height || w->b != ev->border_width);
+    return (w->w != ev->width || w->h != ev->height
+            || w->b != ev->border_width);
 }
 
 static inline XRectangle wutls_border_ext (win_t const * const w)
 {
-    return (XRectangle) { w->x - w->b, w->y - w->b, w->w + 2 * w->b, w->h + 2 * w->b };
+    return (XRectangle) {
+        w->x,
+        w->y,
+        w->w + 2 * w->b,
+        w->h + 2 * w->b
+    };
 }
 
 static inline XRectangle wutls_shadow_ext (win_t const * const w)
 {
-    const unsigned int r_offset = (3 * opts.shdw_radius + 1) & ~1;
+    unsigned int const r_offset = (int)ceil(3 * opts.shdw_radius + 1) & ~1;
     return (XRectangle) {
         w->x + opts.shdw_x_offset - (r_offset >> 1),
         w->y + opts.shdw_y_offset - (r_offset >> 1),
@@ -315,8 +331,7 @@ static inline XRectangle wutls_shadow_ext (win_t const * const w)
 }
 
 /* Performs a simple 2D Gaussian blur of radius @radius on surface @surface. */
-void
-blur_image_surface (cairo_surface_t *surface, int r)
+void blur_image_surface (cairo_surface_t * const surface, short const r)
 {
     float kernel[2 * r + 1];
     int const size = ARRAY_LENGTH (kernel);
@@ -331,16 +346,17 @@ blur_image_surface (cairo_surface_t *surface, int r)
         };
         uint32_t pix;
         uint8_t subpix[4];
-    } * restrict s, * restrict d, p;
+    } * restrict s, * restrict d;
 
-    if (cairo_surface_status (surface))
+    if (cairo_surface_status(surface))
         return;
 
-    const unsigned int width  = cairo_image_surface_get_width(surface);
-    const unsigned int height = cairo_image_surface_get_height(surface);
+    unsigned int const width  = cairo_image_surface_get_width(surface);
+    unsigned int const height = cairo_image_surface_get_height(surface);
 
     cairo_surface_t * const tmp = cairo_image_surface_create(
             CAIRO_FORMAT_ARGB32, width, height);
+
     if (cairo_image_surface_get_format(surface) != CAIRO_FORMAT_ARGB32 || !tmp)
         return;
 
@@ -354,8 +370,8 @@ blur_image_surface (cairo_surface_t *surface, int r)
         float sum = 0;
 
         for (int i = 0; i < size; i++) {
-	        const float f = i - half;
-            sum += kernel[i] = ((1.0 / (sqrt (2 * M_PI * r))) * exp ((- (f*f)) / (2 * r * r)));
+            const float f = i - half;
+            sum += kernel[i] = (1 / sqrt(2 * M_PI * r)) * exp(- (f * f) / (2 * r * r));
         }
 
         for (int i = 0; i < size; i++)
@@ -388,28 +404,29 @@ blur_image_surface (cairo_surface_t *surface, int r)
         d = (union raw_pixel_data *) (src + i * src_stride);
 
         for (int j = 0; j < width; j++) {
-            if ((r << 2) <= i && i < width - (r) >> 2)
+            if ((r << 2) <= i && i < width - (r) >> 2) {
                 d[j].a = s[j].a;
-            else {
-                float x = 0;
-                for (int k = 0; k < size; k++) {
-                    if (i - half + k >= 0 && i - half + k < height) {
-                        s = (union raw_pixel_data *) (dst + (i - half + k) * dst_stride);
-                        x += s[j].a * kernel[k];
-                    }
-                }
-                d[j].a = (uint8_t)x;
+                continue;
             }
+
+            float x = 0;
+            for (int k = 0; k < size; k++) {
+                if (i - half + k >= 0 && i - half + k < height) {
+                    s = (union raw_pixel_data *) (dst + (i - half + k) * dst_stride);
+                    x += s[j].a * kernel[k];
+                }
+            }
+            d[j].a = (uint8_t)x;
         }
     }
 
-    cairo_surface_destroy (tmp);
-    cairo_surface_mark_dirty (surface);
+    cairo_surface_destroy(tmp);
+    cairo_surface_mark_dirty(surface);
 }
 
-static inline cairo_surface_t *wutls_shadow_make(win_t const * const w)
+static inline cairo_surface_t *wutls_shadow_make (win_t const * const w)
 {
-    const int center = ((3 * opts.shdw_radius + 1) & ~1) / 2;
+    int const center = (int)ceil(3 * opts.shdw_radius + 1) >> 1;
 
     XRectangle sr = wutls_shadow_ext(w);
     XRectangle br = wutls_border_ext(w);
@@ -472,18 +489,17 @@ static win_t * win_add (Window const wid, bool const existing)
 {
     XWindowAttributes attr;
 
-    xerr_ignore(XNextRequest(display));
-    if (XGetWindowAttributes(display, wid, &attr)) {
+    if (XERR_IGNORE_FAULT(XGetWindowAttributes(display, wid, &attr))) {
         win_t * const w = malloc(sizeof(win_t));
         if (!w)
             errx(EXIT_FAILURE, "Cannot allocate memory\n");
         memset(w, 0, sizeof(win_t));
 
-        w->wid      = wid;
-        w->screen   = attr.screen;
-        w->state    = attr.map_state;
-        w->vis      = attr.visual;
-        w->type     = win_props_det(wid);
+        w->wid    = wid;
+        w->screen = attr.screen;
+        w->state  = attr.map_state;
+        w->vis    = attr.visual;
+        w->type   = win_props_det(wid);
 
         w->b = attr.border_width;
         w->x = attr.x;
@@ -491,12 +507,12 @@ static win_t * win_add (Window const wid, bool const existing)
         w->w = attr.width;
         w->h = attr.height;
 
-        w->shadow_sag.geom  = wutls_shadow_ext(w);
-        w->content_sag.geom = wutls_border_ext(w);
+        w->shadow_sag.geom.r  = wutls_shadow_ext(w);
+        w->content_sag.geom.r = wutls_border_ext(w);
 
         list_append(&win_list, w);
 
-        if (existing && is_visible(w))
+        if (existing && w->state == IsViewable)
             win_map(wid);
 
         return w;
@@ -505,7 +521,7 @@ static win_t * win_add (Window const wid, bool const existing)
     return NULL;
 }
 
-static void win_del (const Window wid)
+static void win_del (Window const wid)
 {
     win_t * const w = win_find(wid);
 
@@ -519,7 +535,7 @@ static void win_del (const Window wid)
             cairo_surface_destroy(w->shadow);
 
         if (w->damage)
-            XDamageDestroy(display, w->damage);
+            XERR_IGNORE_FAULT(XDamageDestroy(display, w->damage));
 
         win_this_damage(w);
         list_delete(&win_list, (list_elem_t *)w);
@@ -527,11 +543,13 @@ static void win_del (const Window wid)
     }
 }
 
-static char const * const bgrnd_props[] = { "_XROOTPMAP_ID", "_XSETROOT_ID" };
-
 static Pixmap root_get_pixmap (Window const rw)
 {
     Pixmap ret_pm = None;
+    char const * const bgrnd_props[] = {
+        ATOM_WIN_BGRND_XROOTPMAP,
+        ATOM_WIN_BGRND_XSETROOT
+    };
 
     for (size_t i = 0; i < ARRAY_LENGTH(bgrnd_props) && ret_pm == None; i++) {
         Atom name_atom = XInternAtom(display, bgrnd_props[i], False);
@@ -614,8 +632,8 @@ static void win_config (XConfigureEvent const * const ev)
             w->above = ev->above;
         }
 
-        w->shadow_sag.geom  = wutls_shadow_ext(w);
-        w->content_sag.geom = wutls_border_ext(w);
+        w->shadow_sag.geom.r  = wutls_shadow_ext(w);
+        w->content_sag.geom.r = wutls_border_ext(w);
         win_this_damage(w);
     }
 }
@@ -662,7 +680,7 @@ static void win_unmap (Window const wid)
         w->state = IsUnmapped;
 
         if (w->damage) {
-            XDamageDestroy(display, w->damage);
+            XERR_IGNORE_FAULT(XDamageDestroy(display, w->damage));
             w->damage = None;
         }
 
@@ -670,7 +688,7 @@ static void win_unmap (Window const wid)
     }
 }
 
-inline static void root_paint (
+static inline void root_paint (
         cairo_surface_t  * const restrict dst,
         cairo_surface_t  * const restrict src, 
         XRectangle const * const restrict r,
@@ -686,7 +704,7 @@ inline static void root_paint (
     for (size_t i = 0; i < nrects; i++)
         cairo_rectangle(cr, r[i].x, r[i].y, r[i].width, r[i].height);
 
-    cairo_paint(cr);
+    cairo_fill(cr);
     cairo_destroy(cr);
 }
 
@@ -699,12 +717,12 @@ bool list_cb_cmp_win (list_elem_t *e, list_cb_arg_t *arg)
 
 static inline XserverRegion paint_do_dirty_work (
         cairo_surface_t * const dst_surf,
-        cairo_operator_t const  op,
-        surf_geom_t * const     sag)
+        cairo_operator_t  const op,
+        surf_geom_t     * const sag)
 {
     int nrects;
 
-    XserverRegion const w_reg = XFixesCreateRegion(display, &(sag->geom), 1);
+    XserverRegion const w_reg = XFixesCreateRegion(display, &(sag->geom.r), 1);
     XFixesIntersectRegion(display, w_reg, dmg_glbl_reg, w_reg);
     XRectangle * const r = XFixesFetchRegion(display, w_reg, &nrects);
 
@@ -724,39 +742,42 @@ static inline XserverRegion paint_do_dirty_work (
     return w_reg;
 }
 
-bool list_cb_paint_item (list_elem_t *e, list_cb_arg_t *unsed_arg)
+bool list_cb_paint_item (list_elem_t * const e, list_cb_arg_t *unsed_arg)
 {
     win_t * const w = (win_t * const)e;
 
-    if (is_visible(w)) {
+    if (w && is_visible(w)) {
         if (w->content) {
-            XserverRegion w_reg = paint_do_dirty_work(cs,
+            XserverRegion const w_reg = paint_do_dirty_work(cs,
                     CAIRO_OPERATOR_SOURCE, &(w->content_sag));
             XFixesSubtractRegion(display, dmg_glbl_reg, dmg_glbl_reg, w_reg);
             XFixesDestroyRegion(display, w_reg);
         }
 
         if (w->shadow) {
-            XserverRegion w_reg = paint_do_dirty_work(cs_alp,
+            XserverRegion const w_reg = paint_do_dirty_work(cs_alp,
                     CAIRO_OPERATOR_DEST_OVER, &(w->shadow_sag));
             XFixesDestroyRegion(display, w_reg);
         }
     }
+
+    return true;
 }
 
 bool list_cb_print_item (list_elem_t *e, list_cb_arg_t *unsed_arg)
 {
     win_t const * const w = (win_t *)e;
-    Window const wid = (Window const)((win_t *)e)->wid;
     char *win_name;
 
-    XFetchName(display, wid, &win_name);
-    printf("Window id 0x%x [%s]\n", (int)wid, win_name);
+    XFetchName(display, w->wid, &win_name);
+    printf("Window id 0x%x [%s]\n", (int)w->wid, win_name);
 
     XFree(win_name);
+
+    return true;
 }
 
-int main(int argc, char *argv[])
+int main (int argc, char *argv[])
 {
     int opt;
     while ((opt = getopt(argc, argv, "x:y:r:o:h")) != -1) {
@@ -765,13 +786,13 @@ int main(int argc, char *argv[])
                 opts.shdw_x_offset = atoi(optarg);
                 break;
             case 'y':
-                opts.shdw_x_offset = atoi(optarg);
+                opts.shdw_y_offset = atoi(optarg);
                 break;
             case 'r':
-                opts.shdw_radius   = atoi(optarg);
+                opts.shdw_radius   = abs(atoi(optarg));
                 break;
             case 'o':
-                opts.shdw_opacity  = atof(optarg);
+                opts.shdw_opacity  = fmax(0.0, fmin(1.0, atof(optarg)));
                 break;
             case 'h':
             default:
@@ -783,8 +804,6 @@ int main(int argc, char *argv[])
     display = XOpenDisplay(NULL);
     if (display == NULL)
         errx(EXIT_FAILURE, "Cannot open display\n");
-
-    XSetErrorHandler(xerr_handler);
 
     int comp_opcode, comp_ev, comp_err;
     if (!XQueryExtension (display, COMPOSITE_NAME, &comp_opcode, &comp_ev, &comp_err))
@@ -801,7 +820,8 @@ int main(int argc, char *argv[])
             ATOM_WIN_TYPE_DESKTOP,
             ATOM_WIN_TYPE_DOCK,
             ATOM_WIN_TYPE_NORMAL,
-            ATOM_WIN_OPACITY };
+            ATOM_WIN_OPACITY
+        };
         XInternAtoms(display, names, ARRAY_LENGTH(atoms.as_array), True, atoms.as_array);
     }
 
@@ -824,7 +844,7 @@ int main(int argc, char *argv[])
                 &children, &nchildren);
 
         for (unsigned int i = 0; i < nchildren; i++)
-            win_add(children[i], true); /* True mean "add an existing window". */
+            win_add(children[i], true); /* True means "add an existing window". */
 
         if (children)
             XFree(children);
@@ -853,6 +873,7 @@ int main(int argc, char *argv[])
                     cs = cairo_xlib_surface_create(display,
                             XdbeAllocateBackBufferName(display, overlay, XdbeUndefined),
                             DefaultVisual(display, DefaultScreen(display)), root->w, root->h);
+
                     XserverRegion const root_reg = XFixesCreateRegion(display, &(root->r), 1);
                     dmg_glbl_add(root_reg);
                 }
@@ -881,12 +902,13 @@ int main(int argc, char *argv[])
                 break;
             default:
                 if (damage_event + XDamageNotify) {
-                    win_t *w = win_find(((XDamageNotifyEvent *)&event)->drawable);
+                    XDamageNotifyEvent const * const dmg_ev = (XDamageNotifyEvent *)&event;
+                    win_t const * const w = win_find(dmg_ev->drawable);
 
                     if (w && w->damage) {
                         XserverRegion parts = XFixesCreateRegion(display, NULL, 0);
                         XDamageSubtract(display, w->damage, None, parts);
-                        XFixesTranslateRegion(display, parts, w->x, w->y);
+                        XFixesTranslateRegion(display, parts, w->x + w->b, w->y + w->b);
                         dmg_glbl_add(parts);
                     }
                 }
@@ -897,7 +919,7 @@ int main(int argc, char *argv[])
         if (!QLength(display) && dmg_glbl_reg && cs) {
             cs_alp = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, root->w, root->h);
 
-            unsigned int nrects;
+            int nrects;
             XRectangle * const r = XFixesFetchRegion(display, dmg_glbl_reg, &nrects);
 
             list_foreach(&win_list, list_cb_paint_item, NULL);
