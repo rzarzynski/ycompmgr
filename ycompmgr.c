@@ -50,6 +50,20 @@
 #define ARRAY_LENGTH(array)         (sizeof(array) / sizeof(array[0]))
 #define IF_DEBUG(x)
 
+#define MAX(a, b)                   \
+({                                  \
+    __typeof__(a) const _a = (a);   \
+    __typeof__(b) const _b = (b);   \
+    _a > _b ? _a : _b;              \
+})
+
+#define MIN(a, b)                   \
+({                                  \
+    __typeof__(a) const _a = (a);   \
+    __typeof__(b) const _b = (b);   \
+    _a > _b ? _b : _a;              \
+})
+
 #define ATOM_WIN_TYPE               "_NET_WM_WINDOW_TYPE"
 #define ATOM_WIN_TYPE_DESKTOP       "_NET_WM_WINDOW_TYPE_DESKTOP"
 #define ATOM_WIN_TYPE_DOCK          "_NET_WM_WINDOW_TYPE_DOCK"
@@ -99,7 +113,7 @@ typedef union {
     XRectangle          r;
     struct {
         short           x, y;
-        unsigned short  w, h;
+        short           w, h;
     };
 } ease_xrect_t;
 
@@ -124,11 +138,6 @@ typedef struct {
     union {
         surf_geom_t     content_sag;
         cairo_surface_t *content;
-    };
- 
-    union {
-        surf_geom_t     shadow_sag;
-        cairo_surface_t *shadow;
     };
 } win_t;
 
@@ -161,6 +170,8 @@ static struct {
 static Display          *display;
 static win_t            *root;
 static list_t           win_list;
+static surf_geom_t      shadow_data[8];
+
 static cairo_surface_t  *cs          = NULL;
 static cairo_surface_t  *cs_alp      = NULL;
 static XserverRegion    dmg_glbl_reg = None;
@@ -306,7 +317,7 @@ static inline bool win_want_shadow (win_t const * const w)
     return (w->wid != root->wid && w->type != atoms.win_type_dock);
 }
 
-static inline win_t * win_find(Window const wid)
+static inline win_t * win_find (Window const wid)
 {
     return ((win_t *)list_find(&win_list, list_cb_cmp_win,
             (void *)&wid));
@@ -446,38 +457,104 @@ void blur_image_surface (cairo_surface_t * const surface, short const r)
     cairo_surface_mark_dirty(surface);
 }
 
-static inline cairo_surface_t *wutls_shadow_make (win_t const * const w)
+static void shadow_make_template (void)
 {
-    int const center = (int)ceil(3 * opts.shdw_radius + 1) >> 1;
+    int   const center    = (int)ceil(3 * opts.shdw_radius + 1) >> 1;
+    int   const side_size = 2 * center;
+    short const axo       = abs(opts.shdw_x_offset);
+    short const ayo       = abs(opts.shdw_y_offset);
 
-    XRectangle sr = wutls_shadow_ext(w);
-    XRectangle br = wutls_border_ext(w);
+    cairo_surface_t * const shdw_tmpl = cairo_image_surface_create(
+            CAIRO_FORMAT_ARGB32, side_size + 2 * center, side_size + 2 * center);
 
-    cairo_surface_t *shdw_surf = cairo_image_surface_create(
-            CAIRO_FORMAT_ARGB32, sr.width, sr.height);
+    /* Draw a black rectangle with an user-specified opacity. */
+    {
+        cairo_t * const c = cairo_create(shdw_tmpl);
+#ifdef DEBUG_RED_CORNERS
+        cairo_rectangle(c, 0, 0, side_size + 2 * center, side_size + 2 * center);
+        cairo_set_source_rgba(c, 1, 0, 0, opts.shdw_opacity);
+        cairo_fill(c);
 
-    cairo_t *c = cairo_create(shdw_surf);
-    cairo_rectangle(c, center, center, br.width, br.height);
-    cairo_set_source_rgba(c, 0, 0, 0, opts.shdw_opacity);
-    cairo_fill(c);
-    cairo_destroy(c);
+#else
+        cairo_rectangle(c, center, center, side_size, side_size);
+        cairo_set_source_rgba(c, 0, 0, 0, opts.shdw_opacity);
+#endif /* DEBUG_RED_CORNERS */
 
-    blur_image_surface(shdw_surf, opts.shdw_radius);
+        cairo_fill(c);
+        cairo_destroy(c);
+    }
 
-    return shdw_surf;
+    /* Blur it. */
+    blur_image_surface(shdw_tmpl, opts.shdw_radius);
+
+    /* Template is ready. Cut the corners now. */
+    for (size_t idx = 0; idx < 4; idx++) {
+        bool const i = idx >> 1;
+        bool const j = idx &  1;
+
+        shadow_data[idx].surf = cairo_image_surface_create(
+                CAIRO_FORMAT_ARGB32, 2 * center, 2 * center);
+
+        {
+            cairo_t * const c = cairo_create(shadow_data[idx].surf);
+            cairo_set_source_surface(c, shdw_tmpl,
+                    i * (- center + center - side_size),
+                    j * (- center + center - side_size));
+            cairo_paint(c);
+            cairo_destroy(c);
+        }
+
+        shadow_data[idx].geom = (ease_xrect_t){
+            .x = - center + opts.shdw_x_offset,
+            .y = - center + opts.shdw_y_offset,
+            .w = 2 * center,
+            .h = 2 * center
+        };
+    }
+
+    /* This is time for sides. */
+    for (size_t idx = 4; idx < 8; idx++) {
+        bool const i = (idx ^ 4) >> 1;
+        bool const j = (idx & 1);
+
+        shadow_data[idx].surf = cairo_image_surface_create(
+                CAIRO_FORMAT_ARGB32,
+                !i ? 2 * center + axo : 1,
+                 i ? 2 * center + ayo : 1);
+
+        {
+            cairo_t * const c = cairo_create(shadow_data[idx].surf);
+            cairo_set_source_surface(c, shdw_tmpl,
+                     i * (- 2 * center) - !i * j * side_size,
+                    !i * (- 2 * center) -  i * j * side_size);
+            cairo_paint(c);
+            cairo_destroy(c);
+        }
+
+        shadow_data[idx].geom = (ease_xrect_t){
+            .x = - !i * center +  i * center + opts.shdw_x_offset,
+            .y = -  i * center + !i * center + opts.shdw_y_offset,
+            .w = !i ? 2 * center : (- 2 * center),
+            .h =  i ? 2 * center : (- 2 * center)
+        };
+    }
+
+    cairo_surface_destroy(shdw_tmpl);
 }
 
 static inline void win_this_damage (win_t * const w)
 {
-    XRectangle r = wutls_border_ext(w);
-    XserverRegion w_reg = XFixesCreateRegion(display, &r, 1);
+    if (win_is_inside_root(w)) {
+        size_t nrects = 0;
+        XRectangle r[2];
 
-    dmg_glbl_add(w_reg);
+        r[nrects++] = wutls_border_ext(w);
 
-    // FIXME: possible bug in win_unmap connected with this check
-    if (w->shadow) {
-        XRectangle r_s = wutls_shadow_ext(w);
-        dmg_glbl_add(XFixesCreateRegion(display, &r_s, 1));
+        if (win_want_shadow(w))
+            r[nrects++] = wutls_shadow_ext(w);
+
+        XserverRegion const w_reg = XFixesCreateRegion(display, r, nrects);
+        dmg_glbl_add(w_reg);
     }
 }
 
@@ -489,13 +566,14 @@ static inline Atom win_props_det (Window const wid)
     unsigned long nitems, bytes_after;
     Atom *prop;
 
-    int const ret = XGetWindowProperty(display, wid, atoms.win_type, 0L, 1L, False,
+    int const ret = XERR_IGNORE_FAULT(XGetWindowProperty(display, wid,
+            atoms.win_type, 0L, 1L, False,
             XA_ATOM,
             &actual_type,
             &actual_format,
             &nitems,
             &bytes_after,
-            (unsigned char **)&prop);
+            (unsigned char **)&prop));
 
     if (ret == Success) {
         if (actual_type != None)
@@ -519,6 +597,7 @@ static win_t * win_add (Window const wid, bool const existing)
         w->state  = attr.map_state;
         w->vis    = attr.visual;
         w->type   = win_props_det(wid);
+        w->damage = None;
 
         w->b = attr.border_width;
         w->x = attr.x;
@@ -526,7 +605,6 @@ static win_t * win_add (Window const wid, bool const existing)
         w->w = attr.width;
         w->h = attr.height;
 
-        w->shadow_sag.geom.r  = wutls_shadow_ext(w);
         w->content_sag.geom.r = wutls_border_ext(w);
 
         list_append(&win_list, w);
@@ -549,9 +627,6 @@ static void win_del (Window const wid)
             XFreePixmap(display, cairo_xlib_surface_get_drawable(w->content));
             cairo_surface_destroy(w->content);
         }
-
-        if (w->shadow)
-            cairo_surface_destroy(w->shadow);
 
         if (w->damage)
             XERR_IGNORE_FAULT(XDamageDestroy(display, w->damage));
@@ -578,13 +653,14 @@ static Pixmap root_get_pixmap (Window const rw)
         unsigned long nitems, bytes_after;
         Pixmap *prop;
 
-        int const ret = XGetWindowProperty(display, rw, name_atom, 0L, 1L, False,
+        int const ret = XERR_IGNORE_FAULT(XGetWindowProperty(display, rw,
+                name_atom, 0L, 1L, False,
                 XA_PIXMAP,
                 &actual_type,
                 &actual_format,
                 &nitems,
                 &bytes_after,
-                (unsigned char **)&prop);
+                (unsigned char **)&prop));
 
         if (ret == Success) {
             if (actual_type != None)
@@ -635,11 +711,6 @@ static void win_config (XConfigureEvent const * const ev)
                         b_extd.width,
                         b_extd.height);
             }
-
-            if (w->shadow) {
-                cairo_surface_destroy(w->shadow);
-                w->shadow = wutls_shadow_make(w);
-            }
         }
 
         /* Restacking the root window (item with null predecessor) is a pure nonsens. */
@@ -651,7 +722,6 @@ static void win_config (XConfigureEvent const * const ev)
             w->above = ev->above;
         }
 
-        w->shadow_sag.geom.r  = wutls_shadow_ext(w);
         w->content_sag.geom.r = wutls_border_ext(w);
         win_this_damage(w);
     }
@@ -683,9 +753,6 @@ static void win_map (Window const wid)
                     b_extd.width,
                     b_extd.height);
         }
-
-        if (win_want_shadow(w) && !w->shadow)
-            w->shadow = wutls_shadow_make(w);
 
         win_this_damage(w);
     }
@@ -719,6 +786,7 @@ static inline void root_paint (
 
     cairo_set_source_surface(cr, src, x, y);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_REPEAT);
 
     for (size_t i = 0; i < nrects; i++)
         cairo_rectangle(cr, r[i].x, r[i].y, r[i].width, r[i].height);
@@ -737,28 +805,97 @@ bool list_cb_cmp_win (list_elem_t *e, list_cb_arg_t *arg)
 static inline XserverRegion paint_do_dirty_work (
         cairo_surface_t * const dst_surf,
         cairo_operator_t  const op,
-        surf_geom_t     * const sag)
+        surf_geom_t     * const sag,
+        unsigned short    const off_x,
+        unsigned short    const off_y)
 {
     int nrects;
 
-    XserverRegion const w_reg = XFixesCreateRegion(display, &(sag->geom.r), 1);
+    XRectangle src_r = (XRectangle){
+        sag->geom.x + off_x,
+        sag->geom.y + off_y,
+        sag->geom.w - off_x,
+        sag->geom.h - off_y
+    };
+    XserverRegion const w_reg = XFixesCreateRegion(display, &(src_r), 1);
     XFixesIntersectRegion(display, w_reg, dmg_glbl_reg, w_reg);
     XRectangle * const r = XFixesFetchRegion(display, w_reg, &nrects);
 
     if (nrects > 0) {
         cairo_t * const cr = cairo_create(dst_surf);
         cairo_set_source_surface(cr, sag->surf, sag->geom.x, sag->geom.y);
+        cairo_set_operator(cr, op);
+        cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_REPEAT);
 
         for (size_t i = 0; i < nrects; i++)
             cairo_rectangle(cr, r[i].x, r[i].y, r[i].width, r[i].height);
 
-        cairo_set_operator(cr, op);
         cairo_fill(cr);
         cairo_destroy(cr);
     }
 
     XFree(r);
     return w_reg;
+}
+
+void shadow_paint (win_t * const w)
+{
+    short const ayo      = abs(opts.shdw_y_offset);
+    int const center     = (int)ceil(3  * opts.shdw_radius + 1) >> 1;
+    signed int const sdx = MIN(w->w - 2 * center, 0);
+    signed int const sdy = MIN(w->h - 2 * center, 0);
+
+    for (size_t idx = 0; idx < 4; idx++) {
+        bool const i = idx >> 1;
+        bool const j = idx &  1;
+
+        /* (0, 0) - left top
+         * (0, 1) - left bottom
+         * (1, 0) - right top
+         * (1, 1) - right bottom
+         */
+        surf_geom_t sg = {
+            .surf   = shadow_data[idx].surf,
+            .geom.x = shadow_data[idx].geom.x + w->x + i * w->w,
+            .geom.y = shadow_data[idx].geom.y + w->y + j * w->h,
+            .geom.w = shadow_data[idx].geom.w + !i * (sdx >> 1),
+            .geom.h = shadow_data[idx].geom.h + !j * (sdy >> 1)
+        };
+
+        XserverRegion const w_reg = paint_do_dirty_work(cs_alp,
+                CAIRO_OPERATOR_DEST_OVER, &sg,
+                i * (-sdx + (sdx >> 1)),
+                j * (-sdy + (sdy >> 1)));
+        XFixesDestroyRegion(display, w_reg);
+    }
+
+    /* (0, 0) - left
+     * (0, 1) - right
+     * (1, 0) - top
+     * (1, 1) - bottom
+     */
+    for (size_t idx = 4; idx < 8; idx++) {
+        bool const i = (idx ^ 4) >> 1;
+        bool const j = idx & 1;
+
+        if (!i && sdy < 0)
+            continue;
+        if ( i && sdx < 0)
+            continue;
+
+        surf_geom_t sg = {
+            .surf   = shadow_data[idx].surf,
+            .geom.x = shadow_data[idx].geom.x +      w->x + !i *  j * w->w,
+            .geom.y = shadow_data[idx].geom.y +      w->y +  i *  j * w->h,
+            .geom.w = shadow_data[idx].geom.w +  i * w->w + !i * !j * sdx / 2,
+            .geom.h = shadow_data[idx].geom.h + !i * w->h +  i * !j * sdy / 2
+        };
+
+        XserverRegion const w_reg = paint_do_dirty_work(cs_alp,
+                CAIRO_OPERATOR_DEST_OVER, &sg,
+                !i * j * (-sdx + sdx / 2), i * j * (-sdy + sdy / 2));
+        XFixesDestroyRegion(display, w_reg);
+    }
 }
 
 bool list_cb_paint_item (list_elem_t * const e, list_cb_arg_t *unsed_arg)
@@ -768,16 +905,13 @@ bool list_cb_paint_item (list_elem_t * const e, list_cb_arg_t *unsed_arg)
     if (w && win_is_visible(w)) {
         if (w->content) {
             XserverRegion const w_reg = paint_do_dirty_work(cs,
-                    CAIRO_OPERATOR_SOURCE, &(w->content_sag));
+                    CAIRO_OPERATOR_SOURCE, &(w->content_sag), 0, 0);
             XFixesSubtractRegion(display, dmg_glbl_reg, dmg_glbl_reg, w_reg);
             XFixesDestroyRegion(display, w_reg);
         }
 
-        if (w->shadow) {
-            XserverRegion const w_reg = paint_do_dirty_work(cs_alp,
-                    CAIRO_OPERATOR_DEST_OVER, &(w->shadow_sag));
-            XFixesDestroyRegion(display, w_reg);
-        }
+        if (win_want_shadow(w))
+            shadow_paint(w);
     }
 
     return true;
@@ -846,6 +980,7 @@ int main (int argc, char *argv[])
 
     list_init(&win_list);
     root = win_add_root(DefaultRootWindow(display));
+    shadow_make_template();
 
     XCompositeRedirectSubwindows(display, root->wid, CompositeRedirectManual);
     {
@@ -914,9 +1049,9 @@ int main (int argc, char *argv[])
                     win_unmap(event.xunmap.window);
                 break;
             case ReparentNotify:
+                break;
             case CirculateNotify:
             case Expose:
-                break;
             case PropertyNotify:
                 break;
             default:
@@ -926,7 +1061,7 @@ int main (int argc, char *argv[])
 
                     if (w && win_is_visible(w) && w->damage) {
                         XserverRegion parts = XFixesCreateRegion(display, NULL, 0);
-                        XDamageSubtract(display, w->damage, None, parts);
+                        XERR_IGNORE_FAULT(XDamageSubtract(display, w->damage, None, parts));
                         XFixesTranslateRegion(display, parts, w->x + w->b, w->y + w->b);
                         dmg_glbl_add(parts);
                     }
